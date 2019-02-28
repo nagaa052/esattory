@@ -1,76 +1,94 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"log"
-	"os"
 	"strconv"
 	"time"
 
-	"github.com/nagaa052/esattory/bot"
+	"github.com/hori-ryota/esa-go/esa"
+	"github.com/nagaa052/esattory/config"
+	"github.com/nlopes/slack"
 )
 
-var (
-	esaToken    = os.Getenv("ESA_API_TOKEN")
-	esaTeamName = os.Getenv("ESA_TEAM_NAME")
-	slackToken  = os.Getenv("SLACK_TOKEN")
-	postChannel = os.Getenv("SLACK_POST_CHANNEL_ID")
-	location    = os.Getenv("LOCATION")
-	summaryDays = os.Getenv("SUMMARY_DAYS")
-	includeWip  = os.Getenv("INCLUDE_WIP_FLAG")
-)
-
-func init() {
-	if esaToken == "" {
-		log.Fatalln("must be set in ESA_API_TOKEN")
-	}
-
-	if esaTeamName == "" {
-		log.Fatalln("must be set in ESA_TEAM_NAME")
-	}
-
-	if slackToken == "" {
-		log.Fatalln("must be set in SLACK_TOKEN")
-	}
-
-	if postChannel == "" {
-		log.Fatalln("must be set in SLACK_POST_CHANNEL_ID")
-	}
-
-	if location == "" {
-		location = "Asia/Tokyo"
-	}
-
-	if summaryDays == "" {
-		summaryDays = "7"
-	}
-
-	// time zone fix
-	loc, err := time.LoadLocation(location)
-	if err != nil {
-		loc = time.FixedZone(location, 9*60*60)
-	}
-	time.Local = loc
+// Bot ...
+type Bot struct {
+	esaClient        esa.Client
+	slackClient      *slack.Client
+	slackPostChannel string
+	summaryDays      int
 }
 
 func main() {
-	sumD, err := strconv.Atoi(summaryDays)
-	if err != nil {
-		log.Fatalln("cast error SUMMARY_DAYS")
+	b := &Bot{
+		esaClient:        esa.NewClient(config.EsaToken(), config.EsaTeamName()),
+		slackClient:      slack.New(config.SlackToken()),
+		slackPostChannel: config.SlackPostChannelID(),
+		summaryDays:      config.SummaryDays(),
 	}
-
-	inWip := false
-	if includeWip == "1" {
-		inWip = true
-	}
-
-	b := bot.New(bot.Options{
-		EsaToken:         esaToken,
-		EsaTeamName:      esaTeamName,
-		SlackToken:       slackToken,
-		SlackPostChannel: postChannel,
-		SummaryDays:      sumD,
-		IncludeWip:       inWip,
-	})
 
 	b.Run()
+}
+
+func (bot *Bot) getHotentry(page uint, perPage uint) ([]esa.Post, error) {
+	res, err := bot.esaClient.ListPosts(
+		context.Background(),
+		esa.ListPostsParam{
+			Q:     "updated:>" + getAgoDays(bot.summaryDays),
+			Sort:  "best_match",
+			Order: esa.DESC,
+		},
+		page,
+		perPage,
+	)
+
+	return res.Posts, err
+}
+
+func (bot *Bot) postSlack(posts []esa.Post) (string, string, string, error) {
+	attachments := bot.toSlackAttachments(posts)
+	return bot.slackClient.SendMessage(
+		bot.slackPostChannel,
+		slack.MsgOptionText("Hottent esa post", false),
+		slack.MsgOptionAttachments(attachments...))
+}
+
+func (bot *Bot) toSlackAttachments(posts []esa.Post) []slack.Attachment {
+	var attachments = make([]slack.Attachment, 0, len(posts))
+	for i := range posts {
+		post := posts[i]
+		log.Printf("UpdatedAt:%s, Title: %s, star: %d, watch: %d, URL: %s", post.UpdatedAt, post.Name, *post.StargazersCount, *post.WatchersCount, post.URL)
+
+		attachments = append(attachments, slack.Attachment{
+			Color:      "good",
+			Title:      post.FullName,
+			TitleLink:  post.URL,
+			AuthorName: post.UpdatedBy.ScreenName,
+			AuthorIcon: post.UpdatedBy.Icon,
+			Footer:     fmt.Sprintf(":star:%d  :eyes: %d  :speech_balloon: %d", *post.StargazersCount, *post.WatchersCount, *post.CommentsCount),
+			Ts:         json.Number(strconv.FormatInt(post.UpdatedAt.Unix(), 10)),
+		})
+	}
+	return attachments
+}
+
+func getAgoDays(days int) string {
+	return time.Now().Add(time.Duration(-24*days) * time.Hour).Format("2006-01-02")
+}
+
+// Run ...
+func (bot *Bot) Run() error {
+	log.Println("run bot")
+	posts, err := bot.getHotentry(1, 10)
+	if err != nil {
+		return err
+	}
+	_, _, _, err = bot.postSlack(posts)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
